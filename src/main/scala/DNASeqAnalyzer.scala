@@ -1,3 +1,5 @@
+import org.apache.commons.io.FileUtils
+import org.apache.commons.io.filefilter.WildcardFileFilter
 import org.apache.spark.{RangePartitioner, SparkContext, SparkConf, HashPartitioner}
 import org.apache.spark.SparkContext._
 import sys.process._
@@ -22,7 +24,7 @@ import tudelft.utils.SAMRecordIterator
 import org.apache.commons.lang3.exception.ExceptionUtils
 import org.apache.spark.storage.StorageLevel._
 
-import collection.mutable.HashMap
+import scala.collection.mutable.{ArrayBuffer, HashMap}
 
 object DNASeqAnalyzer 
 {
@@ -91,34 +93,34 @@ def variantCall (chrRegion: Int, samRecordsSorted: Array[SAMRecord], config: Con
 	//	Note that MemString here is -Xmx14336m, and already defined as a constant variable above, and so are reference files' names.
 
 	// SAM records should be sorted by this point
-	val bamp1Temp = tmpFolder + "region" + chrRegion + "-p1.bam"
-	val chrRange = writeToBAM(bamp1Temp, samRecordsSorted, config)
+	val regionP1bam = tmpFolder + "region" + chrRegion + "-p1.bam"
+	val chrRange = writeToBAM(regionP1bam, samRecordsSorted, config)
 
 	// Picard preprocessing
 	//	java MemString -jar toolsFolder/CleanSam.jar INPUT=tmpFolder/regionX-p1.bam OUTPUT=tmpFolder/regionX-p2.bam
-	val bamp2Temp = tmpFolder + "region" + chrRegion + "-p2.bam"
+	val regionP2bam = tmpFolder + "region" + chrRegion + "-p2.bam"
 
 	Seq("java", MemString, "-jar", toolsFolder + "CleanSam.jar"
-		,"INPUT=" + bamp1Temp
-		,"OUTPUT=" + bamp2Temp) !
+		,"INPUT=" + regionP1bam
+		,"OUTPUT=" + regionP2bam) !
 
 	//	java MemString -jar toolsFolder/MarkDuplicates.jar INPUT=tmpFolder/regionX-p2.bam OUTPUT=tmpFolder/regionX-p3.bam
 	//		METRICS_FILE=tmpFolder/regionX-p3-metrics.txt
-	val bamp3Temp = tmpFolder + "region" + chrRegion + "-p3.bam"
-	val metricTemp = tmpFolder + "region" + chrRegion + "-p3-metrics.txt"
+	val regionP3bam = tmpFolder + "region" + chrRegion + "-p3.bam"
+	val regionP3metrics = tmpFolder + "region" + chrRegion + "-p3-metrics.txt"
 
 	Seq("java", MemString, "-jar", toolsFolder + "MarkDuplicates.jar"
-		,"INPUT=" + bamp2Temp
-		,"OUTPUT=" + bamp3Temp
-		,"METRIC=" + metricTemp) !
+		,"INPUT=" + regionP2bam
+		,"OUTPUT=" + regionP3bam
+		,"METRICS_FILE=" + regionP3metrics) !
 
 	//	java MemString -jar toolsFolder/AddOrReplaceReadGroups.jar INPUT=tmpFolder/regionX-p3.bam OUTPUT=tmpFolder/regionX.bam
 	//		RGID=GROUP1 RGLB=LIB1 RGPL=ILLUMINA RGPU=UNIT1 RGSM=SAMPLE1
-	val bamTemp = tmpFolder + "region" + chrRegion + ".bam"
+	val regionBam = tmpFolder + "region" + chrRegion + ".bam"
 
 	Seq("java", MemString, "-jar", toolsFolder + "AddOrReplaceReadGroups.jar"
-		,"INPUT=" + bamp3Temp
-		,"OUTPUT=" + bamTemp
+		,"INPUT=" + regionP3bam
+		,"OUTPUT=" + regionBam
 		,"RGID=GROUP1"
 		,"RGLB=LIB1"
 		,"RGPL=ILLUMINA"
@@ -127,55 +129,94 @@ def variantCall (chrRegion: Int, samRecordsSorted: Array[SAMRecord], config: Con
 
 	// 	java MemString -jar toolsFolder/BuildBamIndex.jar INPUT=tmpFolder/regionX.bam
 
-	Seq("java", MemString, "-jar", toolsFolder + "BuildBamIndex.jar", "INPUT=" + bamTemp) !
+	Seq("java", MemString, "-jar", toolsFolder + "BuildBamIndex.jar", "INPUT=" + regionBam) !
 
 	//	delete tmpFolder/regionX-p1.bam, tmpFolder/regionX-p2.bam, tmpFolder/regionX-p3.bam and tmpFolder/regionX-p3-metrics.txt
-	Files.deleteIfExists(Paths.get(bamp1Temp))
-	Files.deleteIfExists(Paths.get(bamp2Temp))
-	Files.deleteIfExists(Paths.get(bamp3Temp))
-	Files.deleteIfExists(Paths.get(metricTemp))
+	Files.deleteIfExists(Paths.get(regionP1bam))
+	Files.deleteIfExists(Paths.get(regionP2bam))
+	Files.deleteIfExists(Paths.get(regionP3bam))
+	Files.deleteIfExists(Paths.get(regionP3metrics))
 
 
 	// Make region file
 	//	val tmpBed = new File(tmpFolder/tmpX.bed)
-	val bedTemp = tmpFolder + "tmp" + chrRegion + ".bed"
-	val tmpBed = new File(bedTemp)
-	chrRange.writeToBedRegionFile(tmpBed.getAbsolutePath())
+	val tmpBed = tmpFolder + "tmp" + chrRegion + ".bed"
+	val tmpBedFile = new File(tmpBed)
+	chrRange.writeToBedRegionFile(tmpBedFile.getAbsolutePath())
 
 	//	toolsFolder/bedtools intersect -a refFolder/ExomeFileName -b tmpFolder/tmpX.bed -header > tmpFolder/bedX.bed
-	val bedFileTemp = tmpFolder + "bed" + chrRegion + ".bed"
-	Seq(toolsFolder, "bedtools", "intersect", "-a", refFolder + ExomeFileName, "-b", bedTemp, "-header") #> new File(bedFileTemp) !
+	val bedBed = tmpFolder + "bed" + chrRegion + ".bed"
+	Seq(toolsFolder + "bedtools", "intersect", "-a", refFolder + ExomeFileName, "-b", tmpBed, "-header") #> new File(bedBed) !
 
 	//	delete tmpFolder/tmpX.bed
-	Files.deleteIfExists(Paths.get(bedTemp))
+	Files.deleteIfExists(Paths.get(tmpBed))
 
 	// Indel Realignment
 	//	java MemString -jar toolsFolder/GenomeAnalysisTK.jar -T RealignerTargetCreator -nt numOfThreads -R refFolder/RefFileName
 	//		-I tmpFolder/regionX.bam -o tmpFolder/regionX.intervals -L tmpFolder/bedX.bed
+	val regionIntervals = tmpFolder + "region" + chrRegion + ".intervals"
 
 	Seq("java", MemString, "-jar", toolsFolder + "GenomeAnalysisTK.jar"
-		,"-T RealignerTargetCreator -nt", numOfThreads, "-R", refFolder + RefFileName) !
+		,"-T", "RealignerTargetCreator", "-nt", numOfThreads, "-R", refFolder + RefFileName
+		,"-I", regionBam, "-o", regionIntervals, "-L", bedBed) !
 
 	//	java MemString -jar toolsFolder/GenomeAnalysisTK.jar -T IndelRealigner -R refFolder/RefFileName -I tmpFolder/regionX.bam
 	//		-targetIntervals tmpFolder/regionX.intervals -o tmpFolder/regionX-2.bam -L tmpFolder/bedX.bed
+	val region2bam = tmpFolder + "region" + chrRegion + "-2.bam"
+
+	Seq("java", MemString, "-jar", toolsFolder + "GenomeAnalysisTK.jar"
+			,"-T", "IndelRealigner", "-R", refFolder + RefFileName, "-I", regionBam
+			,"-targetIntervals", regionIntervals, "-o", region2bam, "-L", bedBed) !
+
 	//	delete tmpFolder/regionX.bam, tmpFolder/regionX.bai, tmpFolder/regionX.intervals
+	Files.deleteIfExists(Paths.get(regionBam))
+	Files.deleteIfExists(Paths.get(regionIntervals))
+	Files.deleteIfExists(Paths.get(tmpFolder + "region" + chrRegion + ".bai"))
 
 	// Base quality recalibration
 	//	java MemString -jar toolsFolder/GenomeAnalysisTK.jar -T BaseRecalibrator -nct numOfThreads -R refFolder/RefFileName -I
 	//		tmpFolder/regionX-2.bam -o tmpFolder/regionX.table -L tmpFolder/bedX.bed --disable_auto_index_creation_and_locking_when_reading_rods
 	//		-knownSites refFolder/SnpFileName
+	val regionTable = tmpFolder + "region" + chrRegion + ".table"
+	Seq("java", MemString, "-jar", toolsFolder + "GenomeAnalysisTK.jar"
+		,"-T", "BaseRecalibrator" ,"-nct", numOfThreads, "-R", refFolder + RefFileName
+		,"-I", region2bam, "-o", regionTable, "-L", bedBed
+		,"--disable_auto_index_creation_and_locking_when_reading_rods", "-knownSites", refFolder + SnpFileName) !
+
 	//	java MemString -jar toolsFolder/GenomeAnalysisTK.jar -T PrintReads -R refFolder/RefFileName -I
 	//		tmpFolder/regionX-2.bam -o tmpFolder/regionX-3.bam -BSQR tmpFolder/regionX.table -L tmpFolder/bedX.bed
+	val region3bam = tmpFolder + "region" + chrRegion + "-3.bam"
+
+	Seq("java", MemString, "-jar", toolsFolder + "GenomeAnalysisTK.jar"
+		,"-T", "PrintReads", "-R", refFolder + RefFileName, "-I", region2bam
+		,"-o", region3bam, "-BQSR", regionTable, "-L", bedBed) !
+
 	// delete tmpFolder/regionX-2.bam, tmpFolder/regionX-2.bai, tmpFolder/regionX.table
+	Files.deleteIfExists(Paths.get(region2bam))
+	Files.deleteIfExists(Paths.get(regionTable))
+	Files.deleteIfExists(Paths.get(tmpFolder + "region" + chrRegion + "-2.bai"))
+
 
 	// Haplotype -> Uses the region bed file
 	// java MemString -jar toolsFolder/GenomeAnalysisTK.jar -T HaplotypeCaller -nct numOfThreads -R refFolder/RefFileName -I
 	//		tmpFolder/regionX-3.bam -o tmpFolder/regionX.vcf  -stand_call_conf 30.0 -stand_emit_conf 30.0 -L tmpFolder/bedX.bed
 	//		--no_cmdline_in_header --disable_auto_index_creation_and_locking_when_reading_rods
+	val regionVcf = tmpFolder + "region" + chrRegion + ".vcf"
+
+	Seq("java", MemString, "-jar", toolsFolder + "GenomeAnalysisTK.jar"
+		,"-T", "HaplotypeCaller", "-nct", numOfThreads, "-R", refFolder + RefFileName
+		,"-I", region3bam, "-o", regionVcf, "-stand_call_conf", "30.0", "-stand_emit_conf", "30.0", "-L", bedBed
+		,"--no_cmdline_in_header", "--disable_auto_index_creation_and_locking_when_reading_rods") !
+
 	// delete tmpFolder/regionX-3.bam, tmpFolder/regionX-3.bai, tmpFolder/bedX.bed
+	Files.deleteIfExists(Paths.get(region3bam))
+	Files.deleteIfExists(Paths.get(bedBed))
+	Files.deleteIfExists(Paths.get(tmpFolder + "region" + chrRegion + "-3.bai"))
 
 	// return the content of the vcf file produced by the haplotype caller.
-	//	Return those in the form of <Chromsome number, <Chromosome Position, line>>
+	//	Return those in the form of <Chromosome number, <Chromosome Position, line>>
+	val vcfParser = new VcfParser(regionVcf)
+	vcfParser.parse()
 }
 
 def createRegionIndex(numParts: Int, numLines: Int): Array[Int] = {
@@ -218,6 +259,7 @@ def main(args: Array[String])
 	// For local mode, include the following two lines
 	conf.setMaster("local[" + config.getNumInstances() + "]")
 	conf.set("spark.cores.max", config.getNumInstances())
+	conf.set("spark.ui.port", "9090")
 	
 	// For cluster mode, include the following commented line
 	//conf.set("spark.shuffle.blockTransferService", "nio") 
@@ -232,9 +274,9 @@ def main(args: Array[String])
 //	val fastq1 = sc.textFile("../test.txt")
 //	val fastq2 = sc.textFile("../test2.txt")
 
-	val fastq1 = sc.textFile("/data/spark/fastq/fastq1.fq")
-	val fastq2 = sc.textFile("/data/spark/fastq/fastq2.fq")
-
+//	val fastq1 = sc.textFile("/data/spark/fastq/fastq1.fq")
+//	val fastq2 = sc.textFile("/data/spark/fastq/fastq2.fq")
+//
 //	val fastq1WithIdx = fastq1.zipWithIndex().map(_.swap)
 //	val fastq2WithIdx = fastq2.zipWithIndex().map(_.swap)
 //
@@ -262,56 +304,149 @@ def main(args: Array[String])
 	//val chunks = sc.wholeTextFiles(config.getInputFolder + "/part-*",config.getNumInstances.toInt)
 
 	// get input filenames
-	val filenames = Seq("ls", config.getInputFolder) #| Seq("grep", "part") !!
-	val fileArray = filenames.split("\n")
-	val chunks = sc.parallelize(fileArray, config.getNumInstances.toInt)
+//	val filenames = Seq("ls", config.getInputFolder) #| Seq("grep", "part") !!
+//	val fileArray = filenames.split("\n")
+//	val chunks = sc.parallelize(fileArray, config.getNumInstances.toInt)
+	val chunkDir = new File(config.getInputFolder)
+	val chunkFiles = FileUtils.listFiles(chunkDir, new WildcardFileFilter("part*"), null)
+	val chunkPaths = chunkFiles.map(f => f.getAbsolutePath).toSeq.sorted
+	val chunks = sc.parallelize(chunkPaths, config.getNumInstances.toInt)
 
 	val configBc = sc.broadcast(config)
 
-	val samRecords = chunks.mapPartitionsWithIndex({
-		(idx, iter) => {
-			iter.map(x => {
-				val receivedConfig = configBc.value
-				val fileName = receivedConfig.getInputFolder + x
+//	val samRecords = chunks.mapPartitionsWithIndex({
+//		(idx, iter) => {
+//			iter.map(x => {
+//				val receivedConfig = configBc.value
+//				val fileName = receivedConfig.getInputFolder + x
+//				val bwaOutput = bwaRun(fileName, receivedConfig)
+//				bwaOutput
+//			})
+//		}
+//	}, preservesPartitioning = true)
+
+	val samRecords = chunks.mapPartitions({
+		iter => {
+
+			var bwaArray = new Array[(Int, SAMRecord)](0)
+
+			val receivedConfig = configBc.value
+
+			for (elem <- iter) {
+				val fileName = elem
 				val bwaOutput = bwaRun(fileName, receivedConfig)
-				bwaOutput
-			})
+				bwaArray = bwaArray ++ bwaOutput
+			}
+
+			bwaArray.iterator
 		}
 	}, preservesPartitioning = true)
 
-	val samRecordsFlat = samRecords.flatMap(x => x)
-	val samRecordsFlatWithIdx = samRecordsFlat.sortByKey().zipWithIndex().map(_.swap).cache()
+	//val samRecordsFlat = samRecords.flatMap(x => x)
+	val samRecordsFlatWithIdx = samRecords.sortByKey().zipWithIndex().cache()
 	val lines = samRecordsFlatWithIdx.count()
+	println("lines: " + lines.toString)
 
 	// create region index that will split the samRecord almost equally per instance
 	val regionIndex = createRegionIndex(config.getNumInstances.toInt, lines.toInt)
 	val regionIndexBc = sc.broadcast(regionIndex)
 
-	val regionSamRecords = samRecordsFlatWithIdx.map(x => {
+//	val regionSamRecords = samRecordsFlatWithIdx.map(x => {
+//		val receivedIndex = regionIndexBc.value
+//		val idx = x._2.toInt
+//		(receivedIndex(idx), x._1._2)
+//	}).partitionBy(new HashPartitioner(config.getNumInstances.toInt)).cache()
+
+	val regionSamRecords = samRecordsFlatWithIdx.mapPartitions({iter => {
 		val receivedIndex = regionIndexBc.value
-		val key = x._1.toInt
-		(receivedIndex(key), x._2._2)
-	}).partitionBy(new HashPartitioner(config.getNumInstances.toInt)).cache()
+		iter.map(x => {
+			val idx = x._2.toInt
+			(receivedIndex(idx), x._1._2)
+		})
+	}}, preservesPartitioning = true)
+		.partitionBy(new HashPartitioner(config.getNumInstances.toInt)).cache()
+
+//	regionSamRecords.saveAsObjectFile(config.getTmpFolder + "regionSamRecords")
 
 //	val regionHist = regionSamRecords.map(x => (x._1, 1)).reduceByKey(_+_)
 //	println(regionHist.collect().mkString("\n"))
 
-	val vcf = regionSamRecords.mapPartitions({
+	val regionSamRecordsGroup = regionSamRecords.groupByKey()
+
+//	val vcf = regionSamRecordsGroup.mapPartitions({
+//		iter => {
+//			val configReceived = configBc.value
+//			// since we are sure that each partition only has one (region, iterable[SAMRecord])
+//			// just call iter.next
+//			val elem = iter.next()
+//			val samArray = elem._2.toArray
+//			val region = elem._1
+//
+//			val samRecordSorted = samArray.sortWith(_.compare(_) < 0)
+//			val vcf = variantCall(region, samRecordSorted, configReceived)
+//			vcf.iterator
+//		}
+//	}, preservesPartitioning = true)
+
+	val vcf = regionSamRecordsGroup.mapPartitions({
 		iter => {
 			val configReceived = configBc.value
-			val samArray = new Array[SAMRecord](iter.size)
-			var region = 0
-			// create array of SAMRecord
-			for ((elem, idx) <- iter.zipWithIndex) {
-				region = elem._1
-				samArray(idx) = elem._2
+			// since we are sure that each partition only has one (region, iterable[SAMRecord])
+			// just call iter.next
+			var vcfArray = new Array[(Integer, (Integer, String))](0)
+			for (elem <- iter) {
+				val samArray = elem._2.toArray
+				val region = elem._1
+
+				val samRecordSorted = samArray.sortWith(_.compare(_) < 0)
+				val vcfResult = variantCall(region, samRecordSorted, configReceived)
+				vcfArray = vcfArray ++ vcfResult
 			}
 
-			val samRecordSorted = samArray.sortWith(_.getAlignmentStart < _.getAlignmentStart)
-			val vcf = variantCall(region, samRecordSorted, configReceived)
-			vcf.iterator
+			vcfArray.iterator
+
 		}
+	}, preservesPartitioning = true).partitionBy(new HashPartitioner(config.getNumInstances.toInt)).cache()
+
+//	val fileArray = Seq("region0.vcf", "region1.vcf"
+//		, "region2.vcf", "region3.vcf", "region4.vcf", "region5.vcf", "region6.vcf", "region7.vcf")
+//
+//	val chunks = sc.parallelize(fileArray, config.getNumInstances.toInt)
+//
+//	val vcf = chunks.mapPartitions({
+//		iter => {
+//			val vcfParser = new VcfParser(config.getTmpFolder + iter.next())
+//			vcfParser.parse().iterator
+//		}
+//	}, preservesPartitioning = true)
+
+	// sort the vcf by chromosome number, where in each number the vcf is sorted by position
+	val sortedVcf = vcf.groupByKey().mapValues(x => {
+		val positionVcfArray = x.toArray
+		val positionVcfArraySorted = positionVcfArray.sortWith(_._1 < _._1)
+		positionVcfArraySorted
 	})
+
+	val sortedVcfFlat = sortedVcf.sortByKey().flatMapValues(x => x)
+
+	// write files
+	val vcfLines = sortedVcfFlat.map(x => x._2._2).collect()
+	val header = "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE1"
+
+	val outputFile = new File(config.getOutputFolder + "output.vcf")
+	outputFile.getParentFile().mkdirs()
+	val pw = new PrintWriter(outputFile)
+
+	// write header
+	pw.println(header)
+
+	// write vcf
+	for (elem <- vcfLines) {
+		pw.println(elem)
+	}
+
+	pw.close()
+
 }
 //////////////////////////////////////////////////////////////////////////////
 } // End of Class definition
